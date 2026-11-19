@@ -65,6 +65,19 @@ final class FrameCacheManager {
     private final long createdElapsedMs;        // prefetch start gate (video-open feels instant)
     private static final long PREFETCH_START_DELAY_MS = 1500;
 
+    /** v2.4.6 PHASE 3 (audit fix 3): REAL source frame size se prefetch budget seed karo —
+     *  pehle 1080p assumption (8.3MB) thi, 4K (~33MB) par budget thrash/crash karta tha. */
+    void primeFrameSize(int w, int h) {
+        if (w <= 0 || h <= 0) return;
+        if (avgFrameBytes <= 0) avgFrameBytes = (long) w * h * 4L;
+    }
+
+    /** v2.4.6 PHASE 3 (audit fix 2): memory pressure par poora cache khaali
+     *  (displayed pin respected — entryRemoved on-screen bitmap pool nahi karta). */
+    void trimAll() {
+        cache.evictAll();
+    }
+
     private volatile long displayedFrameIndex = -1;
     private volatile Bitmap displayedBitmap;
 

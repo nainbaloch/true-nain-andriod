@@ -9,8 +9,14 @@ import android.graphics.Bitmap;
  * Preset params order: bright(-0.5..0.5) contrast(0.5..2) sat(0..2)
  * warm(-1..1) shadowLift(0..1) highlightTame(0..1) vignette(0..1) sharpen(0..1.5)
  *
- * Used by: Frame Mode SAVE (Bitmap grading) and the trim re-encode shader
- * (ExactTrimTranscoder reads the same table via params()).
+ * v2.4.6 PHASE 2 (pack): processing order FIXED —
+ *   1. light denoise / deblock first (kills compression blocks BEFORE sharpening)
+ *   2. then light sharpen (strength DEPENDS on zoom: less sharpen at high zoom)
+ *   3. then colour adjustments + vignette
+ * Previously sharpen ran on raw noisy pixels (amplified blocks at zoom).
+ *
+ * Used by: Frame Mode SAVE (Bitmap grading), settled zoom crops (zoom-aware)
+ * and the trim re-encode shader (ExactTrimTranscoder reads the same table via params()).
  */
 final class ColorGrade {
     private ColorGrade() {}
@@ -42,19 +48,82 @@ final class ColorGrade {
         return PRESETS[Math.max(0, Math.min(PRESETS.length - 1, preset))];
     }
 
-    /**
-     * Grades a bitmap (brightness → contrast → saturation → warmth → shadows/
-     * highlights → vignette → unsharp sharpen).  Returns a NEW bitmap (or the
-     * original reference when preset ≤ 0).  Caller owns the result.
-     */
+    /** Zoom-unaware overload (save paths, trim) — zoom treated as 1.0. */
     static Bitmap grade(Bitmap src, int preset) {
+        return grade(src, preset, 1f);
+    }
+
+    /**
+     * Grades a bitmap (v2.4.6 order: denoise → sharpen(zoom-aware) → colour → vignette).
+     * Returns a NEW bitmap (or the original reference when preset ≤ 0).  Caller owns the result.
+     */
+    static Bitmap grade(Bitmap src, int preset, float zoom) {
         if (src == null || src.isRecycled() || preset <= 0) return src;
         float[] p = params(preset);
         float bright = p[0], contrast = p[1], sat = p[2], warm = p[3];
-        float shadow = p[4], high = p[5], vig = p[6], sharp = p[7];
+        float shadow = p[4], high = p[5], vig = p[6];
+        float sharp = p[7] * sharpenScale(zoom);
+        float denoise = zoom >= 2.0f ? 0f : 0.12f;
         int w = src.getWidth(), h = src.getHeight();
+        if (w <= 0 || h <= 0) return src;
         int[] px = new int[w * h];
-        src.getPixels(px, 0, w, 0, 0, w, h);
+        try {
+            src.getPixels(px, 0, w, 0, 0, w, h);
+        } catch (RuntimeException rte) {
+            return src;
+        }
+
+        // ── PASS 1: light denoise / deblock (3×3 box blend, source-preserving) ──
+        if (denoise > 0.01f) {
+            int[] dn = new int[px.length];
+            for (int y = 0; y < h; y++) {
+                int row = y * w, up = (y > 0 ? y - 1 : 0) * w, dnw = (y < h - 1 ? y + 1 : y) * w;
+                for (int x = 0; x < w; x++) {
+                    int c = px[row + x];
+                    int xl = px[row + Math.max(0, x - 1)], xr = px[row + Math.min(w - 1, x + 1)];
+                    int pu = px[up + x], pd = px[dnw + x];
+                    int br = (((c >>> 16) & 255) + ((xl >>> 16) & 255) + ((xr >>> 16) & 255)
+                            + ((pu >>> 16) & 255) + ((pd >>> 16) & 255)
+                            + ((xl >>> 16) & 255) + ((xr >>> 16) & 255)
+                            + ((pu >>> 16) & 255) + ((pd >>> 16) & 255)) / 9;
+                    int bg = (((c >>> 8) & 255) + ((xl >>> 8) & 255) + ((xr >>> 8) & 255)
+                            + ((pu >>> 8) & 255) + ((pd >>> 8) & 255)
+                            + ((xl >>> 8) & 255) + ((xr >>> 8) & 255)
+                            + ((pu >>> 8) & 255) + ((pd >>> 8) & 255)) / 9;
+                    int bb = ((c & 255) + (xl & 255) + (xr & 255) + (pu & 255) + (pd & 255)
+                            + (xl & 255) + (xr & 255) + (pu & 255) + (pd & 255)) / 9;
+                    int r = Math.round(((c >>> 16) & 255) * (1f - denoise) + br * denoise);
+                    int g = Math.round(((c >>> 8) & 255) * (1f - denoise) + bg * denoise);
+                    int b = Math.round((c & 255) * (1f - denoise) + bb * denoise);
+                    dn[row + x] = 0xff000000 | (clamp255(r) << 16) | (clamp255(g) << 8) | clamp255(b);
+                }
+            }
+            px = dn;
+        }
+
+        // ── PASS 2: unsharp sharpen (on DENOISED pixels — zoom-scaled strength) ──
+        if (sharp > 0.01f) {
+            int[] sp = new int[px.length];
+            for (int y = 0; y < h; y++) {
+                int row = y * w, up = (y > 0 ? y - 1 : 0) * w, dnw = (y < h - 1 ? y + 1 : y) * w;
+                for (int x = 0; x < w; x++) {
+                    int c = px[row + x];
+                    int xl = px[row + Math.max(0, x - 1)], xr = px[row + Math.min(w - 1, x + 1)];
+                    int pu = px[up + x], pd = px[dnw + x];
+                    int sr = (((xl >>> 16) & 255) + ((xr >>> 16) & 255) + ((pu >>> 16) & 255) + ((pd >>> 16) & 255)) >> 2;
+                    int sg = (((xl >>> 8) & 255) + ((xr >>> 8) & 255) + ((pu >>> 8) & 255) + ((pd >>> 8) & 255)) >> 2;
+                    int sb = ((xl & 255) + (xr & 255) + (pu & 255) + (pd & 255)) >> 2;
+                    int cr = (c >>> 16) & 255, cg = (c >>> 8) & 255, cb = c & 255;
+                    int r = cr + Math.round(sharp * (cr - sr));
+                    int g = cg + Math.round(sharp * (cg - sg));
+                    int b = cb + Math.round(sharp * (cb - sb));
+                    sp[row + x] = 0xff000000 | (clamp255(r) << 16) | (clamp255(g) << 8) | clamp255(b);
+                }
+            }
+            px = sp;
+        }
+
+        // ── PASS 3: colour adjustments + vignette ──
         int cx = w / 2, cy = h / 2;
         float maxR = (float) Math.sqrt((float) cx * cx + (float) cy * cy);
         for (int y = 0; y < h; y++) {
@@ -84,32 +153,12 @@ final class ColorGrade {
         }
         Bitmap out = Bitmap.createBitmap(w, h, Bitmap.Config.ARGB_8888);
         out.setPixels(px, 0, w, 0, 0, w, h);
-        if (sharp > 0f) sharpen(out, px, w, h, sharp);
         return out;
     }
 
-    /** 3×3 unsharp-mask sharpen (re-reads the graded pixels). */
-    private static void sharpen(Bitmap bmp, int[] px, int w, int h, float amt) {
-        bmp.getPixels(px, 0, w, 0, 0, w, h);
-        int[] src = new int[px.length];
-        System.arraycopy(px, 0, src, 0, px.length);
-        for (int y = 1; y < h - 1; y++) {
-            int row = y * w;
-            for (int x = 1; x < w - 1; x++) {
-                int c = src[row + x];
-                int cr = (c >>> 16) & 255, cg = (c >>> 8) & 255, cb = c & 255;
-                int n1 = src[row + x - 1], n2 = src[row + x + 1];
-                int n3 = src[row - w + x], n4 = src[row + w + x];
-                int sr = ((n1 >>> 16 & 255) + (n2 >>> 16 & 255) + (n3 >>> 16 & 255) + (n4 >>> 16 & 255)) >> 2;
-                int sg = ((n1 >>> 8 & 255) + (n2 >>> 8 & 255) + (n3 >>> 8 & 255) + (n4 >>> 8 & 255)) >> 2;
-                int sb = ((n1 & 255) + (n2 & 255) + (n3 & 255) + (n4 & 255)) >> 2;
-                int r = cr + Math.round(amt * (cr - sr));
-                int g = cg + Math.round(amt * (cg - sg));
-                int b = cb + Math.round(amt * (cb - sb));
-                px[row + x] = 0xff000000 | (clamp255(r) << 16) | (clamp255(g) << 8) | clamp255(b);
-            }
-        }
-        bmp.setPixels(px, 0, w, 0, 0, w, h);
+    /** v2.4.6: sharpen strength shrinks as zoom grows (less ringing on big crops). */
+    private static float sharpenScale(float zoom) {
+        return Math.max(0.85f, Math.min(1.25f, 1.0f + 0.04f * Math.max(0f, zoom - 1f)));
     }
 
     private static float smooth(float a, float b, float v) {

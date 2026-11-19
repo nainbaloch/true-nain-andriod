@@ -292,6 +292,7 @@ public class MainActivity extends Activity {
     private final Runnable slowFrameTick = this::renderSlowFrame;
     private GradedVideoView videoView;   // dual-engine: GL live look (≤1440p) / direct (2K-4K)
     private MediaPlayer mediaPlayer;
+    private ZoomController playerZc;     // v2.4.6 PHASE 1: single zoom engine (player)
     private final java.util.HashMap<String, java.util.ArrayList<View>> controlViews = new java.util.HashMap<>();
     private void registerControl(String key, View v) {
         java.util.ArrayList<View> views = controlViews.get(key);
@@ -460,7 +461,24 @@ public class MainActivity extends Activity {
             updatePlayerPlayButton();
         }
         if (slowActive) { slowPlaying = false; ui.removeCallbacks(slowFrameTick); }
+        if (videoView != null) videoView.glPause();   // v2.4.6 PHASE 2 (audit fix 5)
         super.onPause();
+    }
+
+    @Override
+    protected void onResume() {
+        super.onResume();
+        // v2.4.6 PHASE 2 (audit fix 5): home/back/screen-off ke baad GL restart —
+        // black/frozen screen na ho; surface recreate par player re-attach hota hai.
+        if (videoView != null) videoView.glResume();
+    }
+
+    @Override
+    public void onTrimMemory(int level) {
+        super.onTrimMemory(level);
+        // v2.4.6 PHASE 3 (audit fix 2): low memory par frame cache foran chhota
+        if (level >= TRIM_MEMORY_RUNNING_LOW && frameCache != null) frameCache.trimAll();
+        if (level >= TRIM_MEMORY_COMPLETE) BitmapPool.clear();
     }
 
     @Override
@@ -484,16 +502,19 @@ public class MainActivity extends Activity {
     }
 
     /**
-     * Hardening spec S4.2: deterministic teardown — queued codec closes (source
-     * release, slow-source close) run to completion before the activity is torn
-     * down, so MediaCodec slots are never leaked system-wide.
+     * v2.4.6 PHASE 3 (audit fix 1): shutdown BACKGROUND thread par — pehle main
+     * thread awaitTermination(3s) × 4 = 12s ANR risk tha.  Queued codec closes
+     * ab bhi complete hote hain (daemon nahi), bas UI block nahi hota.
      */
     private void shutdownExecutors() {
-        awaitShutdown(opener); opener = null;
-        awaitShutdown(decoder); decoder = null;
-        awaitShutdown(saver); saver = null;
-        awaitShutdown(slowDecoder); slowDecoder = null;
-        thumbnailWorkers.shutdownNow();
+        final ExecutorService op = opener, dec = decoder, sav = saver, slow = slowDecoder;
+        opener = null; decoder = null; saver = null; slowDecoder = null;
+        Thread t = new Thread(() -> {
+            awaitShutdown(op); awaitShutdown(dec); awaitShutdown(sav); awaitShutdown(slow);
+            thumbnailWorkers.shutdownNow();
+        }, "TN-Shutdown");
+        t.setPriority(Thread.MIN_PRIORITY);
+        t.start();
     }
 
     private static void awaitShutdown(ExecutorService pool) {
@@ -1488,6 +1509,7 @@ public class MainActivity extends Activity {
         shownBitmap = null;
         if (frameCache != null) frameCache.close();
         frameCache = new FrameCacheManager(getApplicationContext());
+        frameCache.primeFrameSize(opened.width, opened.height);   // v2.4.6 PHASE 3: real 4K budget
         frameSourceId = System.nanoTime();
         if (old != null && old != savingBitmap && !old.isRecycled()) BitmapPool.release(old);
         playbackFps = Math.min(playbackFps, PlaybackMath.maxManualFps(opened.fps));
@@ -1599,31 +1621,11 @@ public class MainActivity extends Activity {
         final long[] dragStartMs = {0L};
         final boolean[] dragged = {false};
         final AudioManager audio = (AudioManager) getSystemService(AUDIO_SERVICE);
-        final float[] pinchMidX = {0f};
-        final float[] pinchMidY = {0f};
-        final ScaleGestureDetector scaler = new ScaleGestureDetector(this,
-                new ScaleGestureDetector.SimpleOnScaleGestureListener() {
-                    @Override public boolean onScale(ScaleGestureDetector detector) {
-                        if (gestureLocked) return false;
-                        playerZoom = Math.max(1f, Math.min(maxPlayerZoom(),
-                                playerZoom * detector.getScaleFactor()));
-                        applyPlayerViewTransform();
-                        setPlayerControlsVisible(true);
-                        return true;
-                    }
-                    @Override public void onScaleEnd(ScaleGestureDetector detector) {
-                        // Hardening spec S1.1: gesture khatam hote hi full-res overlay turant.
-                        ui.removeCallbacks(zoomPanRefresh);
-                        refreshZoomOverlay(playerTotalScale, true);
-                    }
-                });
         final GestureDetector gestures = new GestureDetector(this,
                 new GestureDetector.SimpleOnGestureListener() {
                     @Override public boolean onDown(MotionEvent e) { return true; }
-                    @Override public boolean onSingleTapConfirmed(MotionEvent e) {
-                        setPlayerControlsVisible(!controlsVisible);
-                        return true;
-                    }
+                    // v2.4.6: single-tap ab ZoomController.Listener.onSingleTap handle karta hai
+                    // (dono zoom-states mein consistent — double-toggle bug avoided).
                     @Override public boolean onDoubleTap(MotionEvent e) {
                         if (!gestureLocked) {
                             // YouTube-style zones: left 35% = -5s, right 35% = +5s,
@@ -1651,8 +1653,10 @@ public class MainActivity extends Activity {
         // time, so the video stuck and then played (user-reported).
         final long[] lastScrubSeekMs = {0L};
         final long[] pendingScrubTarget = {-1L};
-        touch.setOnTouchListener((v, ev) -> {
-            scaler.onTouchEvent(ev);
+        // v2.4.6 PHASE 1: zoom/pan ab ZoomController ke haath mein (pinch, drag, fling,
+        // wheel, settled-sharp).  Ye lambda ab FALLBACK hai — sirf NOT-zoomed wale
+        // gestures (tap, ±5s double-tap, scrub, brightness/volume, hold-slow).
+        View.OnTouchListener oldPlayerTouch = (v, ev) -> {
             gestures.onTouchEvent(ev);
             int a = ev.getActionMasked();
             if (a == MotionEvent.ACTION_DOWN) {
@@ -1679,43 +1683,14 @@ public class MainActivity extends Activity {
                 gestureMode[0] = 0;
                 // A pointer swap is not a scrub or a fresh pan delta.
                 dragged[0] = true;
-            } else if (ev.getPointerCount() >= 2 && !gestureLocked) {
-                float mx = (ev.getX(0) + ev.getX(1)) * 0.5f;
-                float my = (ev.getY(0) + ev.getY(1)) * 0.5f;
-                if (a == MotionEvent.ACTION_POINTER_DOWN) {
-                    pinchMidX[0] = mx; pinchMidY[0] = my;
-                    lastPanX[0] = mx; lastPanY[0] = my;
-                    gestureMode[0] = 0;
-                    // Zero conflict with pinch: scrub foran cancel — control pinch ko.
-                    if (scrubPill != null) scrubPill.setVisibility(View.GONE);
-                    pendingScrubTarget[0] = -1L;
-                } else if (a == MotionEvent.ACTION_MOVE) {
-                    playerPanX += mx - pinchMidX[0];
-                    playerPanY += my - pinchMidY[0];
-                    pinchMidX[0] = mx; pinchMidY[0] = my;
-                    applyPlayerViewTransform();
-                    dragged[0] = true;
-                    setPlayerControlsVisible(true);
-                    // Hardening spec S1.1: panning rukne par (80 ms debounce) full-res
-                    // viewport decode trigger karo — gesture ke dauran throttled rehta hai.
-                    ui.removeCallbacks(zoomPanRefresh);
-                    ui.postDelayed(zoomPanRefresh, 80L);
-                }
             } else if (a == MotionEvent.ACTION_MOVE && playerPrepared && mediaPlayer != null
-                    && !gestureLocked && !scaler.isInProgress()) {
+                    && !gestureLocked) {
                 float dx = ev.getX() - downX[0];
                 float dy = ev.getY() - downY[0];
                 if (gestureMode[0] == 0 && (Math.abs(dx) > dp(18) || Math.abs(dy) > dp(18))) {
-                    gestureMode[0] = (playerZoom > 1.001f) ? 1 : ((fullscreen && Math.abs(dy) > Math.abs(dx)) ? 2 : 1);
+                    gestureMode[0] = (fullscreen && Math.abs(dy) > Math.abs(dx)) ? 2 : 1;
                 }
-                if (gestureMode[0] == 1 && playerZoom > 1.001f) {
-                    dragged[0] = true;
-                    playerPanX += ev.getX() - lastPanX[0];
-                    playerPanY += ev.getY() - lastPanY[0];
-                    applyPlayerViewTransform();
-                    ui.removeCallbacks(zoomPanRefresh);
-                    ui.postDelayed(zoomPanRefresh, 80L);
-                } else if (gestureMode[0] == 1 && !slowActive) {
+                if (gestureMode[0] == 1 && !slowActive) {
                     // YouTube-style Interactive Scrub Mode: 1 finger horizontal drag.
                     // Full screen width = 60s ya 15% duration (jo chhoti ho), clamped.
                     dragged[0] = true;
@@ -1736,6 +1711,7 @@ public class MainActivity extends Activity {
                         lastScrubSeekMs[0] = now;
                         pendingScrubTarget[0] = -1L;
                         mediaPlayer.seekTo(target, MediaPlayer.SEEK_CLOSEST_SYNC);
+                        seekRefine(target);   // v2.4.6 PHASE 3: idle par exact refine
                     } else {
                         pendingScrubTarget[0] = target;
                     }
@@ -1767,22 +1743,42 @@ public class MainActivity extends Activity {
                     long target = pendingScrubTarget[0];
                     pendingScrubTarget[0] = -1L;
                     mediaPlayer.seekTo(target, MediaPlayer.SEEK_CLOSEST_SYNC);
+                    seekRefine(target);   // v2.4.6 PHASE 3: final exact refine
                 }
                 if (controlsVisible) schedulePlayerControlsHide();
             }
             return true;
+        };
+        // v2.4.6 PHASE 1: ZoomController owns touch + wheel (pinch/drag/fling/zoom);
+        // oldPlayerTouch = fallback (tap, ±5s double-tap, scrub, brightness/volume).
+        playerZc = new ZoomController(this, touch, new ZoomController.Listener() {
+            @Override public void onTransform(Matrix m, float zoom, boolean interacting) {
+                playerZoom = zoom;
+                if (videoView != null) videoView.setLiveZoom(zoom);   // v2.4.6: GL bicubic zoom path
+                float[] vals = new float[9];
+                m.getValues(vals);
+                // ZC matrix: MTRANS = vw/2 + pan − (view-size content)·zoom/2 → pan wapas
+                playerPanX = vals[Matrix.MTRANS_X] + (touch.getWidth() * zoom) / 2f - touch.getWidth() / 2f;
+                playerPanY = vals[Matrix.MTRANS_Y] + (touch.getHeight() * zoom) / 2f - touch.getHeight() / 2f;
+                applyPlayerViewTransform();
+            }
+            @Override public void onSettled(android.graphics.RectF visible, float zoom, int generation) {
+                if (playerZc == null || !playerZc.isCurrent(generation)) return;
+                ui.removeCallbacks(zoomPanRefresh);
+                if (playerPrepared && videoView != null && !videoView.isPlaying()
+                        && !slowActive && zoom > 1.001f) {
+                    refreshZoomOverlay(playerTotalScale, true);   // full-res viewport crop (paused sharp)
+                }
+            }
+            @Override public void onSingleTap() {
+                setPlayerControlsVisible(!controlsVisible);
+            }
         });
-        // DeX/mouse: wheel scroll = zoom in/out (pinch mouse se possible nahi — user note).
-        touch.setOnGenericMotionListener((v, event) -> {
-            if (event.getAction() != MotionEvent.ACTION_SCROLL || gestureLocked) return false;
-            float scroll = event.getAxisValue(MotionEvent.AXIS_VSCROLL);
-            if (scroll == 0f) return false;
-            playerZoom = Math.max(1f, Math.min(maxPlayerZoom(),
-                    playerZoom * (1f + scroll * 0.15f)));
-            applyPlayerViewTransform();
-            setPlayerControlsVisible(true);
-            return true;
-        });
+        playerZc.setDoubleTapZoomEnabled(false);   // double-tap = ±5s seek (approved feature)
+        playerZc.setFallback(oldPlayerTouch);
+        touch.setOnTouchListener(playerZc);
+        touch.setOnGenericMotionListener(playerZc);
+        touch.post(() -> { if (playerZc != null) playerZc.setContent(touch.getWidth(), touch.getHeight()); });
         p.addView(touch, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
@@ -1873,8 +1869,9 @@ public class MainActivity extends Activity {
         fs.setContentDescription("Fullscreen");
         Button rot = pillIcon("↻", v -> cyclePlayerRotation());
         rot.setContentDescription("Rotate content");
-        Button fineRot = pillIcon("⟲", v -> toggleFineRotateMode());   // v2.4.5: free-angle rotate MODE ON/OFF
-        fineRot.setContentDescription("Fine rotate");
+        Button fineRot = pillIcon("360", v -> toggleFineRotateMode());   // v2.4.6: font-proof 360 button
+        fineRot.setTextSize(11);
+        fineRot.setContentDescription("Fine rotate 360");
         Button more = pillIcon("⋮", this::showPlayerMenu);
         more.setContentDescription("More options");
         registerControl("top_menu", more);
@@ -1951,15 +1948,13 @@ public class MainActivity extends Activity {
         pills.addView(new android.widget.Space(this), new LinearLayout.LayoutParams(0, 1, 1f));
 
         LinearLayout rightPill = glassPill();
-        // Zoom −/＋ — phone par pinch ke alawa visible buttons bhi (user request).
+        // Zoom −/＋ — v2.4.6: ZoomController ke animated zoomIn/zoomOut (single engine).
         Button zoomOut = pillIcon("−", v -> {
-            playerZoom = Math.max(1f, playerZoom * 0.8f);
-            applyPlayerViewTransform();
+            if (playerZc != null) playerZc.zoomOut();
         });
         zoomOut.setContentDescription("Zoom out");
         Button zoomIn = pillIcon("＋", v -> {
-            playerZoom = Math.min(maxPlayerZoom(), playerZoom * 1.25f);
-            applyPlayerViewTransform();
+            if (playerZc != null) playerZc.zoomIn();
         });
         zoomIn.setContentDescription("Zoom in");
         speedPillBtn = pillIcon("1.0x", v -> showSpeedPopup(v));
@@ -2135,9 +2130,14 @@ public class MainActivity extends Activity {
     }
 
     /** Rotate cycle: har tap par video 90° ghoomti hai (0→90→180→270→0) —
-     *  koi angle-menu nahi; user jo angle acha lage wahan rok leta hai. */
+     *  koi angle-menu nahi; user jo angle acha lage wahan rok leta hai.
+     *  v2.4.6 FIX (user recording r_05): rotate+zoom ka combo "ajeeb" view banata
+     *  tha (zoomed arm upside-down) — ab rotate par zoom/pan RESET (clean fit). */
     private void cyclePlayerRotation() {
         playerContentRotation = (playerContentRotation + 90) % 360;
+        if (playerZc != null) playerZc.reset(false);   // zoom+pan reset — rotate+zoom combo bug fix
+        playerZoom = 1f;
+        playerPanX = playerPanY = 0f;
         applyPlayerViewTransform();
     }
 
@@ -2245,7 +2245,7 @@ public class MainActivity extends Activity {
         if (slowActive) slowSeekTo(target);
         // SEEK_CLOSEST_SYNC: keyframe par snap — instant, decoder catch-up freeze aur
         // "restart from start" (user-reported OEM CLOSEST bug) dono impossible.
-        else mediaPlayer.seekTo(target, MediaPlayer.SEEK_CLOSEST_SYNC);
+        else { mediaPlayer.seekTo(target, MediaPlayer.SEEK_CLOSEST_SYNC); seekRefine(target); }
         playerSeek.setProgress((int) target);
         playerCurrent.setText(fmtClock(target));
         if (controlsVisible) schedulePlayerControlsHide();
@@ -2800,6 +2800,9 @@ public class MainActivity extends Activity {
 
         SubMenu view = menu.addSubMenu("View");
         view.add("Change View").setOnMenuItemClickListener(i -> { showChangeViewDialog(); return true; });
+        view.add("Fine Rotate (Straighten)").setOnMenuItemClickListener(i -> {
+            toggleFineRotateMode(); return true;
+        });
         // (Fullscreen + Rotate Content REMOVED — duplicates: pill ⛶ aur pill ↻.)
         SubMenu sizing = view.addSubMenu("Fit / Fill / 1:1");
         for (int i = 0; i < VIEW_LABELS.length; i++) {
@@ -2809,7 +2812,11 @@ public class MainActivity extends Activity {
                         playerDisplayMode = m; resetPlayerZoom(); return true;
                     });
         }
-        view.add("Reset Zoom / Pan").setOnMenuItemClickListener(i -> { resetPlayerZoom(); return true; });
+        view.add("Reset Zoom / Pan").setOnMenuItemClickListener(i -> {
+            if (playerZc != null) playerZc.reset(true);   // v2.4.6: animated reset (single engine)
+            resetPlayerZoom();                            // overlay + fine-angle + state cleanup
+            return true;
+        });
         view.add("Clean View").setOnMenuItemClickListener(i -> { setPlayerControlsVisible(false); return true; });
         view.add(gestureLocked ? "Unlock Gestures" : "Gesture Lock")
                 .setOnMenuItemClickListener(i -> { gestureLocked = !gestureLocked; return true; });
@@ -2870,6 +2877,7 @@ public class MainActivity extends Activity {
         viewer = new ZoomableImageView(this);
         viewer.setBackgroundColor(COLOR_BG);
         viewer.setContentDescription("Video frame");
+        viewer.setOnSettledListener(this::onFrameSettledSharp);   // v2.4.6: settled bicubic crop
         viewer.setGestureActions(new ZoomableImageView.GestureActions() {
             @Override public void singleTap() { if (!gestureLocked) setFrameControlsVisible(!frameControlsVisible); }
             // v2.4.4 (user request): RIGHT double-tap = +1 frame, LEFT double-tap = -1 frame.
@@ -2967,8 +2975,10 @@ public class MainActivity extends Activity {
         Button rot = pillIcon("↻", v -> cycleFrameRotation());
         rot.setContentDescription("Rotate frame");
         pill.addView(rot, new LinearLayout.LayoutParams(dp(44), dp(40)));
-        Button fineRot = pillIcon("⟲", v -> toggleFineRotateMode());   // v2.4.5: free-angle rotate MODE ON/OFF
-        fineRot.setContentDescription("Fine rotate");
+        Button fineRot = pillIcon("360", v -> toggleFineRotateMode());   // v2.4.6: font-proof label
+        fineRot.setTextSize(11);
+        fineRot.setContentDescription("Fine rotate 360");
+        pill.addView(fineRot, new LinearLayout.LayoutParams(dp(44), dp(40)));   // v2.4.6 FIX: pill mein add missing tha
         Button more = pillIcon("⋮", this::showFrameMenu);
         more.setContentDescription("More options");
         registerControl("top_menu", more);
@@ -2992,12 +3002,21 @@ public class MainActivity extends Activity {
      *  upar-neeche-gol jahan marzi), Arrow keys ← → = 1° steps.  Neeche sirf angle
      *  number — koi slider / extra options nahi.  OFF par angle set rehta hai. */
     private void toggleFineRotateMode() {
+        android.util.Log.d("TN360", "toggle: mode=" + mode + " uiSource=" + (uiSource != null)
+                + " viewer=" + (viewer != null) + " videoView=" + (videoView != null)
+                + " overlayFrame=" + (rotateOverlayFrame != null)
+                + " overlayPlayer=" + (rotateOverlayPlayer != null));
         if (mode != MODE_FRAME && mode != MODE_PLAYER) return;
         if (mode == MODE_FRAME && (uiSource == null || viewer == null)) return;
         if (mode == MODE_PLAYER && (uiSource == null || videoView == null)) return;
         fineRotateMode = !fineRotateMode;
+        android.util.Log.d("TN360", "toggled=" + fineRotateMode);
         if (fineRotateMode) {
             updateRotateOverlay();
+            android.util.Log.d("TN360", "overlayFrame visible="
+                    + (rotateOverlayFrame != null && rotateOverlayFrame.getVisibility() == View.VISIBLE)
+                    + " overlayPlayer visible="
+                    + (rotateOverlayPlayer != null && rotateOverlayPlayer.getVisibility() == View.VISIBLE));
         } else {
             if (rotateOverlayFrame != null) rotateOverlayFrame.setVisibility(View.GONE);
             if (rotateOverlayPlayer != null) rotateOverlayPlayer.setVisibility(View.GONE);
@@ -3515,6 +3534,35 @@ public class MainActivity extends Activity {
         if (decodeRunning.compareAndSet(false, true)) getDecoder().execute(this::decodeLoop);
     }
 
+    /** v2.4.6 PHASE 1 (pack): settled par visible region ka BICUBIC sharp crop. */
+    private void onFrameSettledSharp() {
+        if (currentBitmap == null || currentBitmap.isRecycled() || viewer == null) return;
+        final Bitmap bmp = currentBitmap;
+        final android.graphics.RectF vis = viewer.getBitmapVisibleRect();
+        final int gen = viewer.getZcGeneration();
+        final int vw = Math.max(8, viewer.getWidth()), vh = Math.max(8, viewer.getHeight());
+        getDecoder().execute(() -> {
+            try {
+                if (bmp.isRecycled()) return;
+                int l = Math.max(0, (int) Math.floor(vis.left));
+                int t = Math.max(0, (int) Math.floor(vis.top));
+                int r = Math.min(bmp.getWidth(), (int) Math.ceil(vis.right));
+                int b = Math.min(bmp.getHeight(), (int) Math.ceil(vis.bottom));
+                if (r - l < 8 || b - t < 8) return;
+                Bitmap region = Bitmap.createBitmap(bmp, l, t, r - l, b - t);
+                Bitmap sharp = SharpScale.scale(region, vw, vh);
+                region.recycle();
+                if (sharp == null) return;   // OOM — fast path stays (pack rule 6)
+                // v2.4.6 PHASE 2: settled crop par bhi Quality Look (zoom-aware) —
+                // warna zoomed frame look ke bina raw dikhta (pack: "run Quality Look, then post")
+                if (frameGradePreset > 0 && viewer != null)
+                    sharp = ColorGrade.grade(sharp, frameGradePreset, viewer.getZoom());
+                Bitmap finalSharp = sharp;
+                ui.post(() -> { if (viewer != null) viewer.setSharpCrop(finalSharp, gen); });
+            } catch (RuntimeException rte) { /* fast path stays */ }
+        });
+    }
+
     /** v2.4.5 (user request): ±10 click par frame RUKNA nahi — foran MOVE hona.
      *  Intermediate frames queue mein decode hotay huay DISPLAY hote hain (counter
      *  1-1 karke chalta hai), target par ruk kar break.  Naya request aaye to queue
@@ -3539,6 +3587,23 @@ public class MainActivity extends Activity {
         FrameCacheManager fc = frameCache;
         if (fc != null) fc.release(b);
         else b.recycle();
+    }
+
+    // v2.4.6 PHASE 3 (audit fix 4): keyframe-first seek — SYNC foran (hang nahi),
+    // 350 ms idle ke baad CLOSEST refine (paused par exact frame).  Naya seek purane
+    // refine ko cancel karta hai (generation guard).
+    private long playerSeekGen = 0;
+    private Runnable playerSeekRefine;
+
+    private void seekRefine(long targetMs) {
+        final long gen = ++playerSeekGen;
+        ui.removeCallbacks(playerSeekRefine);
+        playerSeekRefine = () -> {
+            if (gen == playerSeekGen && !slowActive && playerPrepared
+                    && mediaPlayer != null && videoView != null && !videoView.isPlaying())
+                mediaPlayer.seekTo(targetMs, MediaPlayer.SEEK_CLOSEST);
+        };
+        ui.postDelayed(playerSeekRefine, 350L);
     }
 
     private void decodeLoop() {

@@ -56,6 +56,24 @@ public final class GradedVideoView extends FrameLayout {
     private Uri pendingUri;
     private volatile boolean glReady;
     private volatile boolean prepared;
+    private volatile float liveZoom = 1f;
+    /** v2.4.6 PHASE 2: live zoom for the GL bicubic sampling path. */
+    public void setLiveZoom(float z) { liveZoom = z; }
+    /** v2.4.6 PHASE 2 (audit fix 5): activity resume par GL restart — black/frozen na ho. */
+    public void glResume() {
+        try { gl.onResume(); } catch (RuntimeException ignored) {}
+        gl.requestRender();
+    }
+    public void glPause() {
+        try { gl.onPause(); } catch (RuntimeException ignored) {}
+    }
+    /** v2.4.6 PHASE 2 (audit fix 5): surface recreate par player dobara attach — warna black. */
+    void reattachPlayerSurface(Surface s) {
+        if (player != null && prepared) {
+            try { player.setSurface(s); } catch (RuntimeException ignored) {}
+            gl.requestRender();
+        }
+    }
     private OnPreparedListener preparedListener;
     private OnCompletionListener completionListener;
     private OnErrorListener errorListener;
@@ -87,6 +105,7 @@ public final class GradedVideoView extends FrameLayout {
         private Surface surface;
         private int program, texId, aPos, aTex, uTexMat;
         private int uTexelLoc, uBrightLoc, uContrastLoc, uSatLoc, uWarmLoc, uShadowLoc, uHighLoc, uVigLoc, uSharpLoc;
+        private int uZoomLoc;   // v2.4.6 PHASE 2
         private final float[] st = new float[16];
         private final FloatBuffer vb;
         private final FloatBuffer tb;
@@ -111,10 +130,11 @@ public final class GradedVideoView extends FrameLayout {
                     + "varying vec2 vTextureCoord;\n"
                     + "void main(){ gl_Position = aPosition; vTextureCoord = (uTexMatrix * aTextureCoord).xy; }";
             String fs = "#extension GL_OES_EGL_image_external : require\n"
-                    + "precision mediump float;\n"
+                    + "precision highp float;\n"
                     + "varying vec2 vTextureCoord;\n"
                     + "uniform samplerExternalOES sTexture;\n"
                     + "uniform vec2 uTexel;\n"
+                    + "uniform float uZoom;\n"
                     + "uniform float uBright;\n"
                     + "uniform float uContrast;\n"
                     + "uniform float uSat;\n"
@@ -123,14 +143,32 @@ public final class GradedVideoView extends FrameLayout {
                     + "uniform float uHigh;\n"
                     + "uniform float uVig;\n"
                     + "uniform float uSharp;\n"
+                    + "float cmr(float x){ x = abs(x); if (x < 1.0) return 1.5*x*x*x - 2.5*x*x + 1.0; if (x < 2.0) return -0.5*x*x*x + 2.5*x*x - 4.0*x + 2.0; return 0.0; }\n"
+                    + "vec3 sampleBicubic(vec2 uv){\n"
+                    + "  vec2 fx = uv / uTexel - 0.5;\n"
+                    + "  vec2 x0 = floor(fx);\n"
+                    + "  vec2 t = fx - x0;\n"
+                    + "  vec3 sum = vec3(0.0);\n"
+                    + "  for (int j = -1; j <= 2; j++) {\n"
+                    + "    for (int i = -1; i <= 2; i++) {\n"
+                    + "      float wx = (i == -1) ? cmr(t.x + 1.0) : (i == 0) ? cmr(t.x) : (i == 1) ? cmr(1.0 - t.x) : cmr(2.0 - t.x);\n"
+                    + "      float wy = (j == -1) ? cmr(t.y + 1.0) : (j == 0) ? cmr(t.y) : (j == 1) ? cmr(1.0 - t.y) : cmr(2.0 - t.y);\n"
+                    + "      vec2 o = clamp((x0 + vec2(float(i), float(j)) + 0.5) * uTexel, uTexel * 0.5, 1.0 - uTexel * 0.5);\n"
+                    + "      sum += texture2D(sTexture, o).rgb * wx * wy;\n"
+                    + "    }\n"
+                    + "  }\n"
+                    + "  return sum;\n"
+                    + "}\n"
                     + "void main(){\n"
-                    + "  vec3 c = texture2D(sTexture, vTextureCoord).rgb;\n"
+                    + "  vec3 c;\n"
+                    + "  if (uZoom > 1.3) c = sampleBicubic(vTextureCoord);\n"
+                    + "  else c = texture2D(sTexture, vTextureCoord).rgb;\n"
                     + "  vec3 n1 = texture2D(sTexture, vTextureCoord + vec2(uTexel.x, 0.0)).rgb;\n"
                     + "  vec3 n2 = texture2D(sTexture, vTextureCoord - vec2(uTexel.x, 0.0)).rgb;\n"
                     + "  vec3 n3 = texture2D(sTexture, vTextureCoord + vec2(0.0, uTexel.y)).rgb;\n"
                     + "  vec3 n4 = texture2D(sTexture, vTextureCoord - vec2(0.0, uTexel.y)).rgb;\n"
                     + "  vec3 blur = (n1 + n2 + n3 + n4) * 0.25;\n"
-                    + "  c = c + (c - blur) * uSharp;\n"
+                    + "  float effSharp = (uZoom > 1.5) ? max(uSharp, 0.30) : uSharp;\n" + "  c = c + (c - blur) * effSharp;\n"
                     + "  c += uBright;\n"
                     + "  c = (c - 0.5) * uContrast + 0.5;\n"
                     + "  float lum = dot(c, vec3(0.299, 0.587, 0.114));\n"
@@ -148,6 +186,7 @@ public final class GradedVideoView extends FrameLayout {
             aTex = GLES20.glGetAttribLocation(program, "aTextureCoord");
             uTexMat = GLES20.glGetUniformLocation(program, "uTexMatrix");
             uTexelLoc = GLES20.glGetUniformLocation(program, "uTexel");
+            uZoomLoc = GLES20.glGetUniformLocation(program, "uZoom");
             uBrightLoc = GLES20.glGetUniformLocation(program, "uBright");
             uContrastLoc = GLES20.glGetUniformLocation(program, "uContrast");
             uSatLoc = GLES20.glGetUniformLocation(program, "uSat");
@@ -167,6 +206,7 @@ public final class GradedVideoView extends FrameLayout {
             texture = new SurfaceTexture(texId);
             texture.setOnFrameAvailableListener(this);
             surface = new Surface(texture);
+            host.reattachPlayerSurface(surface);   // v2.4.6 PHASE 2: resume par player re-attach
             host.markGlReady();
         }
 
@@ -201,9 +241,11 @@ public final class GradedVideoView extends FrameLayout {
             } else {
                 GLES20.glViewport(0, 0, Math.max(1, sw), Math.max(1, sh));
             }
+            GLES20.glUseProgram(program);
             // Quality Look uniforms (live — look badalte hi agle frame par lag jata hai).
             float[] p = ColorGrade.params(lookPreset);
             GLES20.glUniform2f(uTexelLoc, texelX(), texelY());
+            GLES20.glUniform1f(uZoomLoc, host.liveZoom);
             GLES20.glUniform1f(uBrightLoc, p[0]);
             GLES20.glUniform1f(uContrastLoc, p[1]);
             GLES20.glUniform1f(uSatLoc, p[2]);
