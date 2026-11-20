@@ -1832,8 +1832,19 @@ public class MainActivity extends Activity {
             setPlayerControlsVisible(true);
         });
         videoView.setOnErrorListener((mp, what, extra) -> {
+            // v2.4.7 BUG 3: asli error LOG + toast (what/extra + codec/res/fps) —
+            // aur automatic fallback: same video Frame mode mein same position par.
+            String info = videoInfoForError();
+            android.util.Log.e("TNPlayer", "MediaPlayer error what=" + what + " extra=" + extra
+                    + " | " + info + " | uri=" + currentUri);
             Toast.makeText(MainActivity.this,
-                    "This video cannot be played in Media Player. Try FRAME.", Toast.LENGTH_LONG).show();
+                    "Media Player error " + what + " / " + extra + " (" + info
+                            + ") — Frame Mode mein khol raha hoon",
+                    Toast.LENGTH_LONG).show();
+            if (uiSource != null && !loading) {
+                syncPositionUs = capturePositionUs();
+                switchMode(MODE_FRAME);   // hamara MediaCodec decoder — 4K fallback
+            }
             return true;
         });
         GradedVideoView.setLookPreset(frameGradePreset);   // selected look LIVE video par
@@ -1882,6 +1893,34 @@ public class MainActivity extends Activity {
         row.addView(pill, new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT));
         return row;
+    }
+
+    /** v2.4.7 BUG 3: error ke waqt video ki asli info (codec/resolution/fps) — MediaExtractor se. */
+    private String videoInfoForError() {
+        try {
+            android.media.MediaExtractor ex = new android.media.MediaExtractor();
+            try {
+                ex.setDataSource(getApplicationContext(), currentUri, null);
+                for (int i = 0; i < ex.getTrackCount(); i++) {
+                    android.media.MediaFormat f = ex.getTrackFormat(i);
+                    String mime = f.getString(android.media.MediaFormat.KEY_MIME);
+                    if (mime != null && mime.startsWith("video/")) {
+                        String res = f.containsKey(android.media.MediaFormat.KEY_WIDTH)
+                                && f.containsKey(android.media.MediaFormat.KEY_HEIGHT)
+                                ? f.getInteger(android.media.MediaFormat.KEY_WIDTH) + "x"
+                                  + f.getInteger(android.media.MediaFormat.KEY_HEIGHT) : "?";
+                        String fps = f.containsKey(android.media.MediaFormat.KEY_FRAME_RATE)
+                                ? f.getInteger(android.media.MediaFormat.KEY_FRAME_RATE) + "fps" : "?fps";
+                        String profile = f.containsKey(android.media.MediaFormat.KEY_PROFILE)
+                                ? "profile " + f.getInteger(android.media.MediaFormat.KEY_PROFILE) : "";
+                        return mime + " " + res + " " + fps + " " + profile;
+                    }
+                }
+            } finally {
+                ex.release();
+            }
+        } catch (Exception e) { /* info optional hai */ }
+        return "info unavailable";
     }
 
     private LinearLayout buildPlayerBottomBar() {
@@ -3534,13 +3573,20 @@ public class MainActivity extends Activity {
         if (decodeRunning.compareAndSet(false, true)) getDecoder().execute(this::decodeLoop);
     }
 
-    /** v2.4.6 PHASE 1 (pack): settled par visible region ka BICUBIC sharp crop. */
+    /** v2.4.6 PHASE 1 (pack): settled par visible region ka BICUBIC sharp crop.
+     *  v2.4.7 BUG 1 (pack): intersect() ka return value CHECK — rotated visible rect
+     *  bitmap se intersect na kare to EMPTY/invalid crop banta tha → BLACK screen.
+     *  Ab: empty/invalid/failed crop par overlay draw NAHI hota — normal frame dikhta hai. */
     private void onFrameSettledSharp() {
         if (currentBitmap == null || currentBitmap.isRecycled() || viewer == null) return;
         final Bitmap bmp = currentBitmap;
         final android.graphics.RectF vis = viewer.getBitmapVisibleRect();
         final int gen = viewer.getZcGeneration();
         final int vw = Math.max(8, viewer.getWidth()), vh = Math.max(8, viewer.getHeight());
+        // v2.4.7 BUG 1: sanity BEFORE decode — empty/inverted rect → no overlay at all
+        if (vis.isEmpty() || vis.width() < 8 || vis.height() < 8
+                || vis.right <= 0 || vis.bottom <= 0
+                || vis.left >= bmp.getWidth() || vis.top >= bmp.getHeight()) return;
         getDecoder().execute(() -> {
             try {
                 if (bmp.isRecycled()) return;
@@ -3548,18 +3594,26 @@ public class MainActivity extends Activity {
                 int t = Math.max(0, (int) Math.floor(vis.top));
                 int r = Math.min(bmp.getWidth(), (int) Math.ceil(vis.right));
                 int b = Math.min(bmp.getHeight(), (int) Math.ceil(vis.bottom));
-                if (r - l < 8 || b - t < 8) return;
+                if (r - l < 8 || b - t < 8) return;   // degenerate crop → normal frame rahe
                 Bitmap region = Bitmap.createBitmap(bmp, l, t, r - l, b - t);
+                if (region == null || region.getWidth() <= 0 || region.getHeight() <= 0) return;
                 Bitmap sharp = SharpScale.scale(region, vw, vh);
                 region.recycle();
-                if (sharp == null) return;   // OOM — fast path stays (pack rule 6)
+                // v2.4.7 BUG 1: sharp null/invalid/recycled → overlay NAHI — normal frame rahe
+                if (sharp == null || sharp.isRecycled()
+                        || sharp.getWidth() <= 0 || sharp.getHeight() <= 0) return;
                 // v2.4.6 PHASE 2: settled crop par bhi Quality Look (zoom-aware) —
                 // warna zoomed frame look ke bina raw dikhta (pack: "run Quality Look, then post")
-                if (frameGradePreset > 0 && viewer != null)
-                    sharp = ColorGrade.grade(sharp, frameGradePreset, viewer.getZoom());
-                Bitmap finalSharp = sharp;
+                if (frameGradePreset > 0 && viewer != null) {
+                    Bitmap graded = ColorGrade.grade(sharp, frameGradePreset, viewer.getZoom());
+                    if (graded != null && !graded.isRecycled() && graded != sharp) {
+                        sharp.recycle();
+                        sharp = graded;
+                    }
+                }
+                final Bitmap finalSharp = sharp;
                 ui.post(() -> { if (viewer != null) viewer.setSharpCrop(finalSharp, gen); });
-            } catch (RuntimeException rte) { /* fast path stays */ }
+            } catch (RuntimeException rte) { /* fast path stays — normal frame dikhta rahe */ }
         });
     }
 

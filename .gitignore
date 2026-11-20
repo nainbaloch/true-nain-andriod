@@ -67,3 +67,9 @@ coverage/
 *.tar.gz
 *.bak
 *.backup
+
+# Videos (test recordings are NOT committed — listed in docs/TESTING.md only)
+*.mp4
+*.mov
+*.mkv
+*.avi

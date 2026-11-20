@@ -144,8 +144,12 @@ public final class ZoomController implements View.OnTouchListener, View.OnGeneri
     private boolean doubleTapZoomEnabled = true;
     public void setDoubleTapZoomEnabled(boolean on) { doubleTapZoomEnabled = on; }
 
-    /** Displayed content size in SOURCE pixels, after rotation. Call again when rotation or video changes. */
-    public void setContent(int srcW, int srcH) { cw = srcW; ch = srcH; relayout(); }
+    /** Displayed content size in SOURCE pixels, after rotation. Call again when rotation or video changes.
+     *  v2.4.7 BUG 2: no-op when unchanged (prevents relayout/settle loops). */
+    public void setContent(int srcW, int srcH) {
+        if (srcW == cw && srcH == ch && cw > 0) return;
+        cw = srcW; ch = srcH; relayout();
+    }
 
     public void zoomIn()  { zoomBy(1.5f); }
     public void zoomOut() { zoomBy(1f / 1.5f); }
@@ -211,19 +215,22 @@ public final class ZoomController implements View.OnTouchListener, View.OnGeneri
 
     // ---------------------------------------------------------------- internals
 
-    private void setViewSize(int w, int h) { vw = w; vh = h; relayout(); }
+    private void setViewSize(int w, int h) {
+        if (w == vw && h == vh) return;                     // v2.4.7 BUG 2: no change → no relayout loop
+        vw = w; vh = h; relayout();
+    }
 
     private void relayout() {
         if (vw <= 0 || vh <= 0 || cw <= 0 || ch <= 0) return;
         base = Math.min(vw / cw, vh / ch);
         maxZoom = clamp((cw / vw) * 2.5f, 4f, 12f);         // same rule as v2.4.5
         maxZoom = Math.max(maxZoom, Math.min(12f, pixelPerfectZoom()));  // always allow 1:1
-        zoom = clamp(zoom, 1f, maxZoom);
+        zoom = clamp(zoom, 1f, maxZoom);                    // v2.4.7: only clamped if over max — zoom stays stable
         float s = base * zoom;
         panX = -(cxN - 0.5f) * cw * s;
         panY = -(cyN - 0.5f) * ch * s;
         clampPan(zoom);
-        dispatch(false);
+        dispatchQuiet();                                    // v2.4.7 BUG 2: relayout NEVER schedules a settle
     }
 
     private float limX(float z) { return Math.max(0f, (cw * base * z - vw) / 2f); }
@@ -304,6 +311,12 @@ public final class ZoomController implements View.OnTouchListener, View.OnGeneri
     };
 
     private void dispatch(boolean interacting) {
+        dispatch(interacting, true);
+    }
+
+    /** v2.4.7 BUG 2: scheduleSettle=false for relayout — layout/bitmap changes must NOT
+     *  re-trigger the 300ms settle (sharp render) → no relayout/settle loop. */
+    private void dispatch(boolean interacting, boolean scheduleSettle) {
         float s = base * zoom;
         if (s <= 0) return;
         matrix.reset();
@@ -320,9 +333,14 @@ public final class ZoomController implements View.OnTouchListener, View.OnGeneri
         cyN = 0.5f - panY / (s * ch);
 
         listener.onTransform(matrix, zoom, interacting);
-        handler.removeCallbacks(settleTask);
-        handler.postDelayed(settleTask, SETTLE_MS);
+        if (scheduleSettle) {
+            handler.removeCallbacks(settleTask);
+            handler.postDelayed(settleTask, SETTLE_MS);
+        }
     }
+
+    /** Matrix/visible update WITHOUT scheduling a settle (layout changes only). */
+    private void dispatchQuiet() { dispatch(false, false); }
 
     private static float clamp(float v, float lo, float hi) { return v < lo ? lo : (v > hi ? hi : v); }
 }
