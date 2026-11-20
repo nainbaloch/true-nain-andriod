@@ -1,6 +1,6 @@
 # TRUE NAIN — Offline Video Player & Frame Inspector
 
-**Package:** `com.truenain.app` · **Current release:** v2.4.6 (versionCode 246) · **Owner:** Zulqarnain Haider (True Nain, Lahore, PK)
+**Package:** `com.truenain.app` · **Current release:** v2.4.7 (versionCode 247) · **Owner:** Zulqarnain Haider (True Nain, Lahore, PK)
 
 TRUE NAIN is an offline Android video player and frame-accurate inspection tool for devices running **Android 10+** (minSdk 29, targetSdk 35). No internet permission, no ads, no analytics, no telemetry.
 
