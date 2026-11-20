@@ -1,134 +1,88 @@
-# TRUE NAIN — Video Frame Extractor & Slow-Motion Player
+# TRUE NAIN — Offline Video Player & Frame Inspector
 
-**Package:** `com.truenain.app` · **Current release:** v2.0.2 (versionCode 202) · **Owner:** Zulqarnain Haider (True Nain, Lahore, PK)
+**Package:** `com.truenain.app` · **Current release:** v2.4.6 (versionCode 246) · **Owner:** Zulqarnain Haider (True Nain, Lahore, PK)
 
-TRUE NAIN is an offline Android video tool for frame-accurate extraction, zooming, slow-motion playback and multi-range trimming — for devices running **Android 10+** (minSdk 29, targetSdk 35). No Internet permission, no ads, no analytics, no telemetry.
+TRUE NAIN is an offline Android video player and frame-accurate inspection tool for devices running **Android 10+** (minSdk 29, targetSdk 35). No internet permission, no ads, no analytics, no telemetry.
 
----
+> 🔒 This repository is **PRIVATE**. Never commit `keystore.properties`, `*.jks`, `local.properties`, or any signing secret (all excluded in `.gitignore`).
 
-## 📦 Current Release
+## ✨ Features
 
-| | |
-|---|---|
-| **APK** | `app/build/outputs/apk/release/TRUE_NAIN_v2.0.2_FINAL.apk` |
-| **SHA-256** | `D938A5B3F5A2D6D8941DBADFE21EF854FB1CE4370B07EB98459BC1EE1F76C779` |
-| **Signed by** | NEW rotated key — cert SHA-256 `328c046496e1c22a93d014da6346eee2244b5889e8d5917442456b33f0a0138b` |
-| **Scheme** | APK Signature Scheme v3 + **lineage** (old-key users update without uninstalling) |
-| **Build** | Debug ✅ · Release (R8 minify+shrink) ✅ · Lint 0 errors |
+- **Media Player** — playback 0.05x–2.0x (slow speeds are frame-decoded), ±5s double-tap seek, scrub with time pill, pinch zoom, Quality Look filters applied live through a GL shader
+- **Frame Mode** — frame-by-frame inspection of exact source frames (MediaCodec decode), ±1/±10 stepping, hold-to-walk ±5, double-tap ±1, FPS selector 1..source fps, zoom with settled bicubic sharp crop
+- **Frame Extract** — export all frames or custom ranges (`1,5,10,25-100`), Picture Rotate for orientation fixes
+- **Quality Look** — Original / HDR+ / Cinematic / Vivid / Warm / Cool — GL shader live on video, bitmap pipeline on frames, baked into SAVE/Extract output
+- **Fine Rotate (360)** — drag-to-rotate mode + arrow keys (±1°), in both Media Player and Frame Mode
+- **Trim & Merge** — Samsung Video Editor hand-off first, built-in TrimActivity + MediaMuxer fallback
+- **Zoom** — one ZoomController engine for both modes: pinch/drag/fling/wheel, settled bicubic sharp crop, pan bounded by content, rotation-aware
 
-> **v2.0.2 = v2.0.1 + full UI/UX overhaul, verified on emulator:** WCAG-AA contrast palette (dark-on-teal PLAY, dark-on-orange SAVE, deeper player blue), 48dp minimum touch targets on all 31 buttons, 13sp medium labels, ripple feedback, 2-line frame info, 20dp seekbar thumb, TalkBack content-descriptions on every icon button, dynamic Play/Pause descriptions. Emulator-verified: full frame timeline live (**F 1/301** on a 10 s/30 fps clip — keyframe-only code showed ~30), library, permissions, Customize Controls (16 toggles), landscape auto-rotate.
+## Build
 
----
-
-## ✨ What's new in v2.0.1 (vs v1.4.1)
-
-1. **Full Frame Timeline** — every decoded frame is navigable (a 60 s / 30 fps video exposes ~1,800 frames, not just its ~60 keyframes). CFR, VFR and B-frame videos follow true presentation order.
-2. **Advanced Frame Cache engine** — bounded LRU frame cache with ±50 logical prefetch window, dedicated prefetch decoder (never blocks seeking), stale-seek protection (AtomicLong versioning — only the latest seek renders), bitmap pooling, and a slow-motion decode-ahead buffer (16/28/40 frames at 0.25x/0.10x/0.05x).
-3. **⟲ PHOTO ROTATE** — one rotation policy shared by preview, single save, batch export and screenshots. Fixes Samsung portrait/landscape metadata issues.
-4. **🖼 Gallery photo rotate** — rotate ANY photo already in your Gallery (Photo Rotate dialog → 🖼). A rotated copy is saved to `Pictures/TRUE NAIN`; the original is never modified.
-5. **Customize Controls — 16 toggles** — every button across Media Player, Frame Mode and Frame Extractor can be shown/hidden from one dialog (home screen → ⚙ CUSTOMIZE CONTROLS), with long-press to reorder buttons.
-6. **Security: signing key rotated** — old (compromised) key retired via APK Signature Scheme v3 lineage; update compatibility preserved.
-
----
-
-## 🧭 App Modes
-
-| Mode | What it does |
-|---|---|
-| **Media Player** | Playback with seven speeds incl. decoded slow-motion (0.25x/0.10x/0.05x), ±5 s seeks, A–B repeat, zoom/pan, Fit/Fill/1:1, PNG screenshot |
-| **Frame Mode** | Frame-by-frame navigation with seek bar, ±1/±10 steps, auto-play with AUTO/manual FPS, zoom, sharp-frame finder, per-frame PNG save, Frame Lock, Gesture Lock |
-| **Frame Extractor** | EXPORT ALL FRAMES · CUSTOM FRAME RANGE / SELECTION (`1,5,10,25-100`) · ⟲ PHOTO ROTATE · library |
-| **Video Library** | Scans and lists device videos; remembers your preferred mode; resume positions |
-
-All exports land in **`Pictures/TRUE NAIN/`**.
-
----
-
-## 🔨 Building
-
-Requirements: **JDK 17**, **Android SDK (compileSdk 35)**, Gradle wrapper included.
+Requirements: Android SDK 35, JDK 17. Signing reads `keystore.properties` (gitignored) — must contain `storeFile`, `storePassword`, `keyAlias`, `keyPassword`.
 
 ```bat
-:: quick build (debug + release)
-BUILD_WINDOWS.bat
-
-:: or directly
-gradlew.bat :app:assembleDebug
-gradlew.bat :app:assembleRelease
+gradlew.bat :app:assembleRelease   :: signed release APK (R8 on) -> app\build\outputs\apk\release\
+gradlew.bat :app:assembleDebug     :: readable debug build (no obfuscation) — release config untouched
 ```
 
-`keystore.properties` (project root) must point to the release keystore — on this machine it already points to `Master G\Keys\true_nain_v2_release.jks`. **Never commit or share this file.** (`keystore.properties.example` is the safe template.)
+**R8 mapping:** every release build writes `app\build\outputs\mapping\release\mapping.txt`; copies live in `docs/mapping/<version>/`. De-obfuscate crash traces with the SDK `retrace` tool: `retrace mapping.txt stacktrace.txt`. For a **readable build without obfuscation**, build `assembleDebug` (debug buildType is `minifyEnabled false` by default) — the release build config stays unchanged.
 
-### ⚠️ Mandatory release signing step
+## Permissions
 
-The plain Gradle release APK is **not distributable** to existing users (new key, no lineage proof yet). Always finish with:
+- `READ_MEDIA_VIDEO` — video library access
+- `READ_EXTERNAL_STORAGE` (maxSdkVersion 32) — legacy devices
 
-```powershell
-powershell -ExecutionPolicy Bypass -File SIGN_FINAL.ps1
-```
+No internet permission. Saves/extracts go through MediaStore inserts (no storage-write permission needed).
 
-This re-signs with the new key + v3 lineage (`--rotation-min-sdk-version 29`, v3-only) and produces `TRUE_NAIN_v2.0.2_FINAL.apk`. **Skipping this step breaks update-installs for existing users.**
-
-### Verify before distributing
+## Project structure
 
 ```
-apksigner verify --verbose --print-certs TRUE_NAIN_v2.0.2_FINAL.apk
-aapt dump badging TRUE_NAIN_v2.0.2_FINAL.apk
+app/src/main/java/com/truenain/app/
+  MainActivity.java        All UI + orchestration: home, library, Media Player, Frame Mode,
+                           Extractor, menus, gestures, zoom wiring, Quality Look picker,
+                           keyframe-first seek + refine, trim hand-off.
+  GradedVideoView.java     Dual-engine player view: GL shader engine (Quality Look live,
+                           Catmull-Rom bicubic sampling when zoomed, glUseProgram-corrected
+                           uniform pipeline) for ≤1440p; direct SurfaceView engine for
+                           2K-4K with one-shot fallback; glResume/glPause + surface
+                           re-attach lifecycle; fine rotation at view level.
+  ZoomController.java      Shared zoom/pan engine (both modes): pinch, drag, fling, wheel,
+                           double-tap cycle (disabled via flag — approved gestures kept),
+                           rubber-band + spring-back, content-point tracking,
+                           settled callback with generation guard, state save/restore.
+  ZoomableImageView.java   Frame Mode drawing view: ZC-driven zoom/pan, rotation
+                           (90-steps + fine angle) composed in the draw matrix,
+                           FIT/FILL/1:1 via content regions, settled sharp-crop overlay.
+  FrameSource.java         MediaExtractor/MediaCodec frame access: virtual timeline opens
+                           instantly, real PTS index built on a background indexer.
+  ExactFrameDecoder.java   Codec-backed exact frame decode (flush/reseek + drain per request).
+  FrameCacheManager.java   Byte-budgeted LRU of decoded frames + direction-aware prefetch
+                           executor (real frame-size budget) + generation guards + trimAll.
+  FrameData.java           Cache entry (bitmap + PTS + index + rotation state).
+  BitmapPool.java          Process-wide bitmap pool (no per-frame allocation churn).
+  ColorGrade.java          Quality Look bitmap pipeline: denoise -> sharpen(zoom-aware)
+                           -> colour + vignette. Same preset table as the GL shader.
+  SharpScale.java          Catmull-Rom bicubic scaler (settled sharp crops).
+  PlaybackMath.java        Timeline math (frame index <-> PTS, nearest index).
+  SharpFrameScorer.java    Sharpness scoring for "Find Sharper Frame (nearby)".
+  TrimActivity.java        Built-in trim UI (fallback when Samsung editor is absent).
+  TrimExporter.java        Trim/merge export via MediaMuxer.
+docs/
+  ARCHITECTURE.md          Deep dive: activities, threads/executors, pipelines, cache,
+                           shader, lifecycle.
+  TESTING.md               Live test checklist + test video list (no video files committed).
+  KNOWN_ISSUES.md          Current known bugs + status.
+  DECISIONS.md             Design choices with reasons (from comments + git history).
+  AUDIT_BUTTONS_FUNCTIONS_MAP.md  Button -> function -> prefs-key full map.
+  mapping/2.4.6/mapping.txt       R8 mapping for the latest release build.
+  rules/                   The v2.4.6 task pack (rules + audit findings + zoom guide).
+CHANGELOG.md               Per-version history with APK SHA-256.
+docs_working_status.json   Machine-readable working status.
 ```
 
-Must show: `Verifies`, v3 `true`, cert `328c0464…`, package `com.truenain.app`, versionCode 201.
+## Release signing
 
----
+`keystore.properties`-driven signing config (v2 + v3). Certificate SHA-256 (unchanged since v2.0.7):
+`328c046496e1c22a93d014da6346eee2244b5889e8d5917442456b33f0a0138b`
 
-## 🔑 Signing Keys
-
-| Key | Status | Location |
-|---|---|---|
-| **NEW** (all builds) | ✅ active | `Desktop\Master G\Keys\true_nain_v2_release.jks` — alias `true_nain` |
-| Old (COMPROMISED) | 🚫 never sign with it again — but **do not delete** (needed to extend lineage) | `Desktop\Master G\Keys\true_nain_release.jks` |
-
-Full rotation record: **`Desktop\Master G\Keys\KEY_ROTATION.md`**.
-Passwords live in `Master G\Keys\true_nain_v2_keystore.properties` — **never include keys or password files in any ZIP you share.**
-
-Safe share-zip (excludes all secrets):
-
-```powershell
-robocopy <project> <staging> /E /XD keys .gradle .idea build /XF keystore.properties local.properties *.jks *.idsig
-Compress-Archive <staging>\* share.zip
-```
-
----
-
-## 🗂 Project Map
-
-| Path | What |
-|---|---|
-| `Desktop\True Nain APK\TRUE_NAIN_V2.0_ENGINE\` | **This project** — the v2.0 line (source of the current release) |
-| `Desktop\True Nain APK\TRUE_NAIN_UPDATED_SOURCE_2026-10-21_CANDIDATE\` | 30-Oct fork — pristine, kept as reference |
-| `Desktop\Master G\TRUE_NAIN_FINAL_LOCKED\` | Source of the verified v1.4.1 release |
-| `Desktop\Master G\APK Version Wise\` | Archive of all past release APKs |
-| `Desktop\Master G\Keys\` | Both keystores + lineage + `KEY_ROTATION.md` |
-| `Desktop\TRUE_NAIN_v1.4.1_MASTER_BACKUP\` | Hash-verified backup of v1.4.1 source + artifacts |
-
----
-
-## 📜 Version History
-
-| Version | Code | SHA-256 (first 8) | Notes |
-|---|---|---|---|
-| 1.3.3 | 6 | `12700F2D` | First archived release (UI FINAL SOURCE) |
-| 1.4.0 | 140 | `541100C8` | Performance fixes + Picture Rotate |
-| 1.4.1 | 141 | `4ad9b00d` | **Last release on the old key** (key later compromised) |
-| 2.0.1 | 201 | `3DC57B61` | Engine overhaul (superseded same-day) |
-| **2.0.2** | **202** | `D938A5B3` | **Current** — + UI/UX overhaul, emulator-verified |
-
----
-
-## ⚠️ Known Limitations (honest status)
-
-- **No physical-device validation yet** — update-over-install (1.4.1 → 2.0.1), rapid-scrub feel, 4K/HEVC/Samsung behaviour, Perfetto/Macrobenchmark numbers are **CODE VERIFIED but NOT DEVICE VERIFIED**.
-- Trim/Merge (`TrimActivity`, `ExactTrimTranscoder`) not re-audited in the 2.0 line.
-- Extreme slow motion is frame duplication, not optical-flow interpolation.
-- Lint: 0 errors, ~26 pre-existing warnings (i18n, accessibility) — cosmetic.
-
-**Test checklist for a real phone:** update-install over 1.4.1 (data preserved) · open 1080p + 4K video · rapid scrub 100→700→1500 · 0.05x slow-motion · PHOTO ROTATE on Samsung portrait video · Gallery photo rotate · Customize Controls toggles.
+**Never commit** `keystore.properties`, `*.jks`, `keys/`, or `local.properties` — all blocked by `.gitignore`.
